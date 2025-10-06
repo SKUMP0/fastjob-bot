@@ -1,0 +1,16 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local data & artifacts
+.env
+storage/
+data/
+*.db
+*.log
+*.png
+
+# IDE crap
+.vscode/
+.idea/
