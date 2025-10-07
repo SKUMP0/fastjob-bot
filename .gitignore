@@ -1,9 +1,9 @@
-# Python
+# Python venv & caches
 .venv/
 __pycache__/
 *.pyc
 
-# Local data & artifacts
+# Local secrets & data
 .env
 storage/
 data/
@@ -11,6 +11,6 @@ data/
 *.log
 *.png
 
-# IDE crap
+# IDE/editor
 .vscode/
 .idea/
