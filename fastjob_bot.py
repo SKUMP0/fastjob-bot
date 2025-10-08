@@ -1,51 +1,30 @@
-# fastjob_bot.py — robust modal open/confirm/close + header coins delta + popup killer
-#
-# USAGE (PowerShell)
-#   # DRY (no coins), single run
-#   $env:DRY_RUN="true"
-#   $env:LIMIT_JOBS="0"
-#   python .\fastjob_bot.py
-#
-#   # LIVE, all jobs (WILL spend coins)
-#   $env:DRY_RUN="false"
-#   $env:LIMIT_JOBS="0"
-#   python .\fastjob_bot.py
-#
-#   # Optional loop
-#   $env:EVERY_SECONDS="3600"
-#   python .\fastjob_bot.py
-
-import os
-import re
-import time
+# fastjob_bot.py — resilient multi-bump with render/visibility gates
+import os, re, time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 
 from dotenv import load_dotenv
-from playwright.sync_api import (
-    sync_playwright, Page, TimeoutError, Locator, BrowserContext
-)
+from playwright.sync_api import sync_playwright, Page, Locator, TimeoutError
 
-import db  # db.py (get_conn, upsert_job, insert_bump)
+import db
 
-# ---------------------- ENV ----------------------
 load_dotenv()
+
+BASE_URL  = "https://employer.fastjobs.sg"
+COYID     = os.getenv("FASTJOBS_COYID", "235927")
+EMAIL     = os.getenv("FASTJOBS_EMAIL", "")
+PASSWORD  = os.getenv("FASTJOBS_PASSWORD", "")
+LOGIN_URL = os.getenv("FASTJOBS_LOGIN_URL", f"{BASE_URL}/site/login/")
+DASH_URL  = f"{BASE_URL}/p/my-activity/dashboard/?coyid={COYID}"
 
 STORAGE_STATE = os.getenv("STORAGE_STATE", "storage/state.json")
 DB_PATH       = os.getenv("DB_PATH", "data/fastjob.db")
 
-COYID    = os.getenv("FASTJOBS_COYID", "235927")
-EMAIL    = os.getenv("FASTJOBS_EMAIL", "")
-PASSWORD = os.getenv("FASTJOBS_PASSWORD", "")
-
-BASE_URL  = "https://employer.fastjobs.sg"
-LOGIN_URL = os.getenv("FASTJOBS_LOGIN_URL", f"{BASE_URL}/site/login/")
-DASH_URL  = f"{BASE_URL}/p/my-activity/dashboard/?coyid={COYID}"
-
-DRY_RUN        = os.getenv("DRY_RUN", "true").lower() == "true"
-LIMIT_JOBS     = int(os.getenv("LIMIT_JOBS", "0"))       # 0 = all jobs
-EVERY_SECONDS  = int(os.getenv("EVERY_SECONDS", "0"))    # 0 = run once
+DRY_RUN       = os.getenv("DRY_RUN", "true").lower() == "true"
+LIMIT_JOBS    = int(os.getenv("LIMIT_JOBS", "0"))
+EVERY_SECONDS = int(os.getenv("EVERY_SECONDS", "0"))
+SLOW_MO_MS    = int(os.getenv("SLOW_MO_MS", "0"))
 
 JOBS_URLS = [
     f"{BASE_URL}/p/job/manage/?coyid={COYID}",
@@ -53,492 +32,349 @@ JOBS_URLS = [
     f"{BASE_URL}/p/jobs/manage/?coyid={COYID}",
 ]
 
-# ---------------------- regex helpers ----------------------
-JID_RE      = re.compile(r"[?&]jid=(\d+)\b", re.I)
-STAT_ID_RE  = re.compile(r"jobAdStat_(?:views|applications|shares|messages|savedjob|invitation)_(\d+)$", re.I)
-COIN_NUM_RE = re.compile(r"(\d[\d,]*)\s*coin", re.I)
+JID_RE     = re.compile(r"[?&]jid=(\d+)\b", re.I)
+STAT_ID_RE = re.compile(r"jobAdStat_(?:views|applications|shares|messages|savedjob|invitation)_(\d+)$", re.I)
 
-# ---------------------- utils ----------------------
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
 
-def _clean_text(t: str) -> str:
-    return re.sub(r"\s+", " ", t or "").strip()
-
-def _normalize_title(t: str) -> str:
-    t = (t or "").replace("\u00A0", " ").replace("\u2007", " ").replace("\u202F", " ")
-    return _clean_text(t)
+def _clean(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").replace("\u00A0"," ")).strip()
 
 def safe_full_screenshot(page: Page, path: str) -> None:
-    try:
-        page.screenshot(path=path, full_page=True, timeout=6000)
+    try: page.screenshot(path=path, full_page=True, timeout=6000)
     except Exception:
-        try:
-            page.screenshot(path=path, full_page=False, timeout=3000)
-        except Exception:
-            pass
+        try: page.screenshot(path=path, timeout=3000)
+        except Exception: pass
 
-def _read_int_from_text(text: Optional[str]) -> Optional[int]:
-    if not text:
-        return None
-    try:
-        return int(text.replace(",", "").strip())
-    except Exception:
-        return None
+# ---------- UI hygiene (only removes truly global overlays) ----------
 
-# ---------------------- login & nav ----------------------
+def ensure_clean_ui(page: Page) -> None:
+    # Don’t touch the bump modal here; we call this before/after per card.
+    # Close random promos/toasts/backdrops that intercept clicks.
+    for _ in range(2):
+        try: page.keyboard.press("Escape")
+        except Exception: pass
+        for sel in [
+            ".modal-backdrop,.sheet-backdrop",
+            ".swal2-container,.swal2-shown,.swal2-popup",
+            "[class*='toast'],#toast-container",
+        ]:
+            try:
+                if page.locator(sel).count() > 0:
+                    page.locator(sel).first.click(timeout=200, force=True)
+                    page.evaluate("(s)=>document.querySelectorAll(s).forEach(n=>{try{n.remove()}catch(e){}})", sel)
+            except Exception: pass
+        page.wait_for_timeout(80)
+
+# ---------- login & navigation ----------
+
 def ensure_logged_in(page: Page) -> None:
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
     try:
-        email_box = page.get_by_role("textbox", name=re.compile(r"Username|email", re.I))
-        pwd_box   = page.get_by_role("textbox", name=re.compile(r"Password", re.I))
-        email_box.wait_for(state="visible", timeout=2500)
-        pwd_box.wait_for(state="visible", timeout=2500)
-
+        email = page.get_by_role("textbox", name=re.compile("Username|Email", re.I))
+        pwd   = page.get_by_role("textbox", name=re.compile("Password", re.I))
+        email.wait_for(state="visible", timeout=1500)
         if not EMAIL or not PASSWORD:
-            raise RuntimeError("FASTJOBS_EMAIL / FASTJOBS_PASSWORD not set in .env")
-
-        email_box.click()
-        try: email_box.clear()
-        except Exception: pass
-        page.keyboard.insert_text(EMAIL)
-
-        pwd_box.click()
-        try: pwd_box.clear()
-        except Exception: pass
-        page.keyboard.insert_text(PASSWORD)
-
-        page.get_by_role("button", name=re.compile(r"Login|Sign in", re.I)).click()
+            raise RuntimeError("FASTJOBS_EMAIL / FASTJOBS_PASSWORD missing")
+        email.click(); page.keyboard.insert_text(EMAIL)
+        pwd.click();   page.keyboard.insert_text(PASSWORD)
+        page.get_by_role("button", name=re.compile("Login|Sign in", re.I)).click()
         page.wait_for_load_state("networkidle")
     except TimeoutError:
-        pass  # probably already logged in
-
-def close_global_popups(page: Page) -> None:
-    # close marketing/feedback/popovers
-    for sel in [
-        "button[aria-label='Close']",
-        ".modal.show .btn-close, .modal.show [data-dismiss='modal'], .modal.show .close",
-        ".swal2-container .swal2-cancel, .swal2-container .swal2-close, .swal2-container .swal2-confirm",
-        ".toast .btn-close",
-        ".intercom-namespace .intercom-close-button",
-        ".fc-modal .fc-close",
-        ".fast-modal.open .btn-close, .fast-modal.open [data-dismiss='modal']",
-    ]:
-        try:
-            loc = page.locator(sel)
-            if loc.count() > 0 and loc.first.is_visible():
-                loc.first.click(timeout=600)
-                page.wait_for_timeout(200)
-        except Exception:
-            pass
+        pass  # probably already logged-in
 
 def goto_jobs_list(page: Page) -> None:
-    close_global_popups(page)
+    page.goto(DASH_URL, wait_until="domcontentloaded")
+    page.wait_for_load_state("networkidle")
+    try: page.locator(".header-credits-available").wait_for(state="visible", timeout=2500)
+    except Exception: pass
+    ensure_clean_ui(page)
 
-    for name in ["Manage Jobs", "My Jobs", "Jobs", "Job Listings", "Manage Job"]:
+    # Prefer UI nav if present
+    for name in ["Manage English Jobs","English Jobs","Manage Jobs","Jobs","Job Listings"]:
         try:
-            page.get_by_role("link", name=re.compile(rf"^{name}$", re.I)).first.click(timeout=1500)
+            page.get_by_role("link", name=re.compile(rf"^{name}$", re.I)).first.click(timeout=1000)
             page.wait_for_load_state("networkidle")
-            close_global_popups(page)
-            if page.locator("div.job-ad-flexbox").count() > 0:
-                return
-        except Exception:
-            pass
-    for url in JOBS_URLS:
-        try:
-            page.goto(url, wait_until="domcontentloaded")
-            page.wait_for_load_state("networkidle")
-            close_global_popups(page)
-            if page.locator("div.job-ad-flexbox").count() > 0:
-                return
-        except Exception:
-            continue
+            if page.locator("div.job-ad-flexbox").count() > 0: return
+        except Exception: pass
+
+    # Direct URLs with one auto-retry
+    for attempt in range(2):
+        for url in JOBS_URLS:
+            try:
+                page.goto(url, wait_until="domcontentloaded")
+                page.wait_for_load_state("networkidle")
+                if page.locator("div.job-ad-flexbox").count() > 0: return
+            except Exception: continue
+        if attempt == 0:
+            page.reload(); page.wait_for_load_state("networkidle")
     raise RuntimeError("Could not reach a Jobs list page with job cards.")
 
-# ---------------------- extraction ----------------------
+# ---------- discovery helpers ----------
+
 def find_job_cards(page: Page) -> Locator:
     return page.locator("div.job-ad-flexbox")
 
 def extract_title(card: Locator) -> str:
     t = card.locator("h3 a span.job-ad-title")
-    if t.count() > 0:
-        return _normalize_title(t.first.inner_text())
+    if t.count()>0: return _clean(t.first.inner_text())
     h = card.locator("h3")
-    if h.count() > 0:
-        return _normalize_title(h.first.inner_text())
-    return "Unknown Title"
+    return _clean(h.first.inner_text()) if h.count()>0 else "Unknown Title"
 
 def _jid_from_href(href: Optional[str]) -> Optional[str]:
-    if not href:
-        return None
-    m = JID_RE.search(href)
-    return m.group(1) if m else None
+    if not href: return None
+    m = JID_RE.search(href); return m.group(1) if m else None
 
 def _jid_from_stat_id(stat_id: Optional[str]) -> Optional[str]:
-    if not stat_id:
-        return None
-    m = STAT_ID_RE.search(stat_id.strip())
-    return m.group(1) if m else None
+    if not stat_id: return None
+    m = STAT_ID_RE.search(stat_id.strip()); return m.group(1) if m else None
 
 def extract_jid(card: Locator) -> Optional[str]:
-    # 1) anchors with ?jid=
     links = card.locator("a[href*='jid=']")
-    n = min(links.count(), 20)
-    for i in range(n):
-        href = links.nth(i).get_attribute("href") or ""
-        jid = _jid_from_href(href)
-        if jid:
-            return jid
-    # 2) stat id: jobAdStat_*_<jid>
+    for i in range(min(links.count(), 20)):
+        jid = _jid_from_href(links.nth(i).get_attribute("href") or "")
+        if jid: return jid
     stat = card.locator(".stat-number[id^='jobAdStat_']")
-    if stat.count() > 0:
-        sid = stat.first.get_attribute("id") or ""
-        jid = _jid_from_stat_id(sid)
-        if jid:
-            return jid
-    # 3) public URL /<jid>/
-    pub = card.locator("a[href*='fastjobs.sg/'][href*='/job-ad/']")
-    if pub.count() > 0:
+    if stat.count()>0:
+        jid = _jid_from_stat_id(stat.first.get_attribute("id") or "")
+        if jid: return jid
+    pub = card.locator("a[href*='/job-ad/']")
+    if pub.count()>0:
         href = pub.first.get_attribute("href") or ""
         m = re.search(r"/(\d{6,})/", href)
-        if m:
-            return m.group(1)
+        if m: return m.group(1)
     return None
 
-def find_bump_button(card: Locator) -> Optional[Locator]:
-    btn = card.locator("[data-action='bump']")
-    if btn.count() > 0:
-        return btn.first
-    maybe = card.get_by_role("button", name=re.compile(r"\bbump\b", re.I))
-    if maybe.count() > 0:
-        return maybe.first
-    more = card.locator("button:has-text('Bump')")
-    if more.count() > 0:
-        return more.first
+# ---------- render gates & buttons ----------
+
+def wait_for_card_ready(card: Locator) -> None:
+    # Wait until the right action rail exists in the card
+    # (FastJobs lazily mounts pieces on scroll/hover)
+    try:
+        card.wait_for(state="visible", timeout=4000)
+    except Exception: pass
+    # action column or any action button
+    try:
+        card.locator("[data-action], .job-action-link, button").first.wait_for(state="visible", timeout=1500)
+    except Exception: pass
+
+def find_bump_button_dynamic(page: Page, card: Locator) -> Optional[Locator]:
+    # Scroll + hover to trigger lazy mount
+    try: card.scroll_into_view_if_needed()
+    except Exception: pass
+    page.wait_for_timeout(120)
+    try: card.hover(timeout=500)
+    except Exception: pass
+    page.wait_for_load_state("networkidle")
+    wait_for_card_ready(card)
+
+    # Strong selector first
+    btn = card.locator("[data-action='bump']").first
+    if btn.count()>0:
+        try:
+            btn.wait_for(state="visible", timeout=1200)
+            return btn
+        except Exception: pass
+
+    # Text fallback (visible only)
+    alt = card.get_by_role("button", name=re.compile(r"\bBump this job\b", re.I)).filter(has_text=re.compile("Bump", re.I)).first
+    if alt.count()>0:
+        try:
+            alt.wait_for(state="visible", timeout=1200)
+            return alt
+        except Exception: pass
+
+    # Last resort: reveal panel via focus the “More Actions” then re-query
+    try:
+        card.get_by_role("button", name=re.compile("More Actions", re.I)).first.focus()
+        page.wait_for_timeout(200)
+    except Exception: pass
+    btn = card.locator("[data-action='bump']").first
+    if btn.count()>0:
+        try:
+            btn.wait_for(state="visible", timeout=1200)
+            return btn
+        except Exception: pass
+
     return None
 
-def discover_jobs(page: Page) -> List[Dict[str, Optional[str]]]:
-    jobs: List[Dict[str, Optional[str]]] = []
-    cards = find_job_cards(page)
-    total = cards.count()
-    for i in range(total):
-        card = cards.nth(i)
-        jobs.append({
-            "jid": extract_jid(card),
-            "title": extract_title(card),
-            "bump_btn": find_bump_button(card)
-        })
-    return jobs
+# ---------- modal ops ----------
 
-# ---------------------- coins: header & modal readers ----------------------
-def read_header_coins(page: Page) -> Optional[int]:
+def open_bump_modal_for(page: Page, card: Locator, jid: str) -> bool:
+    btn = find_bump_button_dynamic(page, card)
+    if not btn: return False
+
+    # If another modal/backdrop is floating, clear it *before* clicking
+    ensure_clean_ui(page)
+
+    try:
+        btn.scroll_into_view_if_needed()
+        btn.click(timeout=1500)
+    except Exception:
+        try: btn.click(timeout=1200, force=True)
+        except Exception: pass
+
+    try:
+        page.locator("#bump-schedule-modal[data-modal-ready='true']").wait_for(state="visible", timeout=6000)
+        page.wait_for_timeout(150)
+        return True
+    except TimeoutError:
+        return False
+
+def visible_insufficient_modal(page: Page) -> bool:
+    dialog = page.locator("div[role='dialog'], .fast-modal.open")
+    if dialog.count()==0: return False
+    vis = dialog.filter(has_text=re.compile(r"insufficient\s+coins", re.I))
+    try:
+        return vis.count()>0 and vis.first.is_visible()
+    except Exception:
+        return False
+
+def confirm_bump_in_modal(page: Page) -> bool:
+    modal = page.locator("#bump-schedule-modal[data-modal-ready='true']").first
+    if modal.count()==0: return False
+
+    # The confirm button sits inside #order-summary-content
+    btn = modal.locator("#order-summary-content button:has(.button-content:has-text('Bump this job'))").first
+    if btn.count()==0:
+        btn = modal.get_by_role("button", name=re.compile(r"\bBump this job\b", re.I)).first
+        if btn.count()==0: return False
+
+    try: btn.scroll_into_view_if_needed()
+    except Exception: pass
+
+    for i in range(3):
+        try:
+            if i == 0: btn.click(timeout=1200)
+            elif i == 1: btn.click(timeout=1200, force=True)
+            else: page.evaluate("(b)=>b.click()", btn)
+            break
+        except Exception: continue
+
+    # Wait for modal to close (success path)
+    try:
+        page.locator("#bump-schedule-modal").wait_for(state="hidden", timeout=5000)
+        return True
+    except TimeoutError:
+        return False
+
+# ---------- coins helpers ----------
+
+def _int_from_text(s: Optional[str]) -> Optional[int]:
+    if not s: return None
+    m = re.search(r"(\d[\d,\.]*)", s)
+    if not m: return None
+    try: return int(m.group(1).replace(",", "").split(".")[0])
+    except Exception: return None
+
+def coins_from_header(page: Page) -> Optional[int]:
     try:
         txt = page.locator(".header-credits-available").first.inner_text(timeout=900)
-        m = COIN_NUM_RE.search(txt or "")
-        if m:
-            return _read_int_from_text(m.group(1))
+        return _int_from_text(txt)
     except Exception:
-        pass
+        return None
+
+def coins_used_from_modal_total(page: Page) -> Optional[int]:
     try:
-        txt = page.locator(".summary-content .summary-title").first.inner_text(timeout=800)
-        m = COIN_NUM_RE.search(txt or "")
-        if m:
-            return _read_int_from_text(m.group(1))
+        txt = page.locator("#bump-schedule-modal .order-summary__total").first.inner_text(timeout=600)
+        return _int_from_text(txt)
     except Exception:
-        pass
-    return None
+        return None
 
-# ---------------------- bump modal: open / confirm / close ----------------------
-def _any_bump_modal(page: Page) -> Locator:
-    # Support both fast-modal and bootstrap-like modal
-    return page.locator(
-        "#bump-schedule-modal.fast-modal.open, "
-        ".fast-modal.open:has(#order-summary-content), "
-        ".modal.show:has(.order-summary__total), "
-        ".modal.show:has(.button-content:has-text('Bump this job'))"
-    )
+# ---------- cycle ----------
 
-def wait_for_bump_modal(page: Page, timeout_ms: int = 8000) -> Optional[Locator]:
-    end = time.time() + (timeout_ms / 1000.0)
-    while time.time() < end:
-        loc = _any_bump_modal(page)
-        if loc.count() > 0 and loc.first.is_visible():
-            return loc.first
-        page.wait_for_timeout(120)
-    return None
-
-def wait_modal_closed(page: Page, timeout_ms: int = 6000) -> bool:
-    end = time.time() + (timeout_ms / 1000.0)
-    while time.time() < end:
-        if _any_bump_modal(page).count() == 0 and page.locator(".modal-backdrop").count() == 0:
-            return True
-        page.wait_for_timeout(120)
-    return False
-
-def force_close_bump_modal(page: Page) -> None:
-    # try close button
-    for sel in [
-        ".fast-modal.open .btn-close", ".fast-modal.open [data-dismiss='modal']",
-        ".modal.show .btn-close",     ".modal.show [data-dismiss='modal']",
-        ".modal.show .close"
-    ]:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() > 0 and loc.is_visible():
-                loc.click(timeout=600)
-                page.wait_for_timeout(250)
-                if wait_modal_closed(page, 2500):
-                    return
-        except Exception:
-            pass
-    # try ESC
-    try:
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(200)
-        if wait_modal_closed(page, 2500):
-            return
-    except Exception:
-        pass
-    # try clicking backdrop
-    try:
-        bd = page.locator(".modal-backdrop").first
-        if bd.count() > 0 and bd.is_visible():
-            bd.click(timeout=600)
-            page.wait_for_timeout(200)
-            if wait_modal_closed(page, 2500):
-                return
-    except Exception:
-        pass
-    # last resort: remove nodes with JS
-    try:
-        page.evaluate("""
-            () => {
-              for (const sel of ['.fast-modal.open','.modal.show','.modal-backdrop']) {
-                document.querySelectorAll(sel).forEach(n => n.remove());
-              }
-              document.body.style.overflow = '';
-            }
-        """)
-    except Exception:
-        pass
-
-def read_modal_cost_and_balance(modal: Locator) -> Tuple[Optional[int], Optional[int]]:
-    coins_cost: Optional[int] = None
-    coins_after: Optional[int] = None
-    try:
-        t = modal.locator(".order-summary__total").first.inner_text(timeout=800)
-        m = COIN_NUM_RE.search(t or "")
-        if m:
-            coins_cost = _read_int_from_text(m.group(1))
-    except Exception:
-        pass
-    try:
-        t = modal.locator(".coin-balance").first.inner_text(timeout=800)
-        m = COIN_NUM_RE.search(t or "")
-        if m:
-            coins_after = _read_int_from_text(m.group(1))
-    except Exception:
-        pass
-    return coins_cost, coins_after
-
-def click_confirm_in_modal(modal: Locator, page: Page) -> bool:
-    # exact button per your HTML
-    btn = modal.locator("button.button-container:has(.button-content:has-text('Bump this job'))").first
-    try:
-        if btn.count() > 0:
-            btn.scroll_into_view_if_needed(timeout=1500)
-            btn.click(timeout=1800)
-            page.wait_for_timeout(350)
-            return True
-    except Exception:
-        pass
-    # fallback JS click on the .button-content
-    try:
-        modal.evaluate("""
-            (root) => { const b = root.querySelector("button.button-container .button-content"); if (b) b.click(); }
-        """)
-        page.wait_for_timeout(300)
-        return True
-    except Exception:
-        return False
-
-def detect_visible_insufficient(page: Page) -> bool:
-    try:
-        loc = page.locator(".fast-modal.open:has-text('Insufficient'), .modal.show:has-text('Insufficient')")
-        return loc.count() > 0 and loc.first.is_visible()
-    except Exception:
-        return False
-
-# ---------------------- post-bump coin detection ----------------------
-def coins_from_toast_or_body(page: Page) -> Optional[int]:
-    texts: List[str] = []
-    for sel in [
-        "[role='alert']",
-        ".toast", ".alert", "#toast-container",
-        ".swal2-popup", ".modal-dialog",
-        "[class*='toast']", "[class*='alert']",
-    ]:
-        try:
-            arr = page.locator(sel).all_inner_texts()
-            if arr:
-                texts.extend([_clean_text(a) for a in arr if a and a.strip()])
-        except Exception:
-            pass
-    for t in texts:
-        m = COIN_NUM_RE.search(t)
-        if m:
-            return _read_int_from_text(m.group(1))
-    return None
-
-def coins_from_activity_pages(page: Page, jid: Optional[str], title: Optional[str]) -> Optional[int]:
-    for name in ["Credits", "Wallet", "Transactions", "Activity", "Logs", "Usage", "Billing"]:
-        try:
-            link = page.get_by_role("link", name=re.compile(name, re.I)).first
-            if link.count() == 0:
-                continue
-            link.click(timeout=1500)
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(800)
-            safe_full_screenshot(page, f"data/activity_{name.lower()}.png")
-            body = "\n".join(page.locator("body").all_inner_texts() or [])
-            lines = re.findall(r".{0,80}bump.{0,80}", body, flags=re.I)
-            candidates = lines if lines else [body]
-            for text in candidates:
-                m = COIN_NUM_RE.search(text)
-                if m:
-                    return _read_int_from_text(m.group(1))
-        except Exception:
-            continue
-    return None
-
-# ---------------------- one cycle ----------------------
 def run_cycle() -> None:
-    Path(STORAGE_STATE).parent.mkdir(parents=True, exist_ok=True)
     Path("data").mkdir(exist_ok=True)
-
     conn = db.get_conn(DB_PATH)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=80)
-        context = browser.new_context(storage_state=STORAGE_STATE, viewport={"width": 1366, "height": 900})
+        browser = p.chromium.launch(headless=False, slow_mo=SLOW_MO_MS if SLOW_MO_MS>0 else 0)
+        context = browser.new_context(storage_state=STORAGE_STATE, viewport={"width":1366,"height":900})
         page = context.new_page()
-        page.set_default_timeout(10000)
 
         ensure_logged_in(page)
-        page.goto(DASH_URL, wait_until="domcontentloaded")
-        close_global_popups(page)
         goto_jobs_list(page)
-
         safe_full_screenshot(page, "data/jobs_after.png")
 
-        jobs = discover_jobs(page)
+        cards = find_job_cards(page)
+        jobs: List[Dict[str, object]] = []
+        for i in range(cards.count()):
+            c = cards.nth(i)
+            jobs.append({"card": c, "jid": extract_jid(c), "title": extract_title(c)})
+
         print(f"[INFO] Found {len(jobs)} job cards.")
         when = now_iso()
+        batch = jobs if LIMIT_JOBS==0 else jobs[:LIMIT_JOBS]
 
-        to_process = jobs if LIMIT_JOBS == 0 else jobs[:LIMIT_JOBS]
+        for j in batch:
+            ensure_clean_ui(page)
 
-        for j in to_process:
-            jid   = j["jid"]
+            card: Locator = j["card"]  # re-used but button is re-found each time
+            jid  = j["jid"]
             title = j["title"]
-            btn   = j["bump_btn"]
-            has_bump = btn is not None
 
             if not jid:
                 print(f"  [SKIP] Missing jid | title={title}")
                 continue
             if jid == COYID:
-                print(f"  [SKIP] Ignoring company id jid={jid} | title={title}")
+                print(f"  [SKIP] Ignoring company id as jid={jid}")
                 continue
 
             db.upsert_job(conn, jid, title, when)
 
-            if DRY_RUN or not has_bump:
-                print(f"  [DRY] Would bump jid={jid} | title={title} | bump={'yes' if has_bump else 'no'}")
-                try:
-                    db.insert_bump(conn, jid, when, None, "dry-run")
-                except Exception:
-                    pass
+            # DRY
+            if DRY_RUN:
+                btn = find_bump_button_dynamic(page, card)
+                print(f"  [DRY] Would bump jid={jid} | title={title} | bump={'yes' if btn else 'no'}")
+                db.insert_bump(conn, jid, when, None, "dry-run")
                 continue
 
-            # LIVE path
-            outcome = "bump-attempted"
-            coins_used: Optional[int] = None
+            # LIVE
+            before = coins_from_header(page)
+            opened = open_bump_modal_for(page, card, jid)
+            if not opened:
+                print(f"  [ERR] Modal not found for jid={jid}")
+                db.insert_bump(conn, jid, when, None, "modal-not-found")
+                continue
 
-            # header coins BEFORE
-            coins_before = read_header_coins(page)
+            # Only treat as insufficient if a VISIBLE dialog says so
+            if visible_insufficient_modal(page):
+                db.insert_bump(conn, jid, when, 0, "insufficient-coins")
+                # try to close whatever appeared so next card can proceed
+                for sel in [
+                    "#insufficientCoinsModal [data-dismiss='modal']",
+                    "#insufficientCoinsModal button",
+                    "#bump-schedule-modal .fast-modal__close",
+                    "#bump-schedule-modal [data-dismiss='modal']",
+                ]:
+                    try: page.locator(sel).first.click(timeout=400)
+                    except Exception: pass
+                ensure_clean_ui(page)
+                print(f"  [LIVE] jid={jid} | title={title} | outcome=insufficient-coins | coins_used=0")
+                continue
 
-            try:
-                # open modal
-                btn.scroll_into_view_if_needed(timeout=1500)
-                btn.click(timeout=2000)
-                page.wait_for_timeout(450)
-                close_global_popups(page)
-
-                modal = wait_for_bump_modal(page, timeout_ms=9000)
-                if not modal:
-                    safe_full_screenshot(page, f"data/no_modal_{jid}.png")
-                    print(f"  [ERR] Modal not found for jid={jid}")
-                    outcome = "modal-not-found"
-                    db.insert_bump(conn, jid, when, None, outcome)
-                    # ensure no leftover overlay before moving on
-                    force_close_bump_modal(page)
+            ok = confirm_bump_in_modal(page)
+            if not ok:
+                # brief reopen once, in case the button missed due to late scripts
+                ensure_clean_ui(page)
+                if not open_bump_modal_for(page, card, jid) or not confirm_bump_in_modal(page):
+                    db.insert_bump(conn, jid, when, None, "bump-failed")
+                    print(f"  [LIVE] jid={jid} | title={title} | outcome=bump-failed | coins_used=None")
+                    ensure_clean_ui(page)
                     continue
 
-                # read cost/after (pre-confirm snapshot)
-                _cost, _after = read_modal_cost_and_balance(modal)
+            # success; modal is closed now
+            after  = coins_from_header(page)
+            used   = coins_used_from_modal_total(page)
+            if used is None and before is not None and after is not None and after <= before:
+                used = before - after
+            outcome = "bumped" if used is None or used >= 0 else "bumped-unknown-coins"
+            safe_full_screenshot(page, f"data/after_bump_{jid}.png")
+            db.insert_bump(conn, jid, when, used, outcome)
+            print(f"  [LIVE] jid={jid} | title={title} | outcome={outcome} | coins_used={used}")
 
-                # confirm
-                clicked = click_confirm_in_modal(modal, page)
-                if not clicked:
-                    safe_full_screenshot(page, f"data/confirm_click_fail_{jid}.png")
-                    outcome = "bump-failed"
-                    db.insert_bump(conn, jid, when, None, outcome)
-                    force_close_bump_modal(page)
-                    continue
-
-                # give time for processing
-                page.wait_for_timeout(1200)
-
-                # strict insufficient detector
-                if detect_visible_insufficient(page):
-                    outcome = "insufficient-coins"
-                    coins_used = 0
-                else:
-                    # compute via header delta
-                    coins_after = read_header_coins(page)
-                    if coins_before is not None and coins_after is not None and coins_after <= coins_before:
-                        delta = coins_before - coins_after
-                        if delta > 0:
-                            coins_used = delta
-                    # modal re-check if still open with updated balance
-                    m2 = wait_for_bump_modal(page, timeout_ms=1200)
-                    if coins_used is None and m2:
-                        _, modal_after2 = read_modal_cost_and_balance(m2)
-                        if coins_before is not None and modal_after2 is not None and modal_after2 <= coins_before:
-                            delta = coins_before - modal_after2
-                            if delta > 0:
-                                coins_used = delta
-                    # final fallbacks
-                    if coins_used is None:
-                        coins_used = coins_from_toast_or_body(page)
-                    if coins_used is None:
-                        coins_used = coins_from_activity_pages(page, jid=jid, title=title)
-
-                    outcome = "bumped" if (coins_used is not None and coins_used >= 0) else "bumped-unknown-coins"
-
-                safe_full_screenshot(page, f"data/after_bump_{jid}.png")
-
-            except Exception as e:
-                print(f"  [ERR] Live bump failed for jid={jid} | title={title}: {e}")
-                outcome = "bump-failed"
-
-            # ALWAYS close any modal/backdrop before next job
-            force_close_bump_modal(page)
-            wait_modal_closed(page, timeout_ms=3000)
-
-            db.insert_bump(conn, jid, when, coins_used, outcome)
-            print(f"  [LIVE] jid={jid} | title={title} | outcome={outcome} | coins_used={coins_used}")
-            page.wait_for_timeout(500)
+            ensure_clean_ui(page)
 
         context.storage_state(path=STORAGE_STATE)
         context.close()
@@ -546,15 +382,13 @@ def run_cycle() -> None:
 
     print("[DONE] Cycle complete. Screenshot: data/jobs_after.png; DB: data/fastjob.db")
 
-# ---------------------- scheduler loop ----------------------
+# ---------- loop ----------
+
 def interactive_interval_if_needed() -> int:
-    if EVERY_SECONDS > 0:
-        return EVERY_SECONDS
+    if EVERY_SECONDS > 0: return EVERY_SECONDS
     try:
         ans = input("Run every N seconds? (blank for single run): ").strip()
-        if ans == "":
-            return 0
-        return max(0, int(ans))
+        return 0 if ans == "" else max(0, int(ans))
     except Exception:
         return 0
 
