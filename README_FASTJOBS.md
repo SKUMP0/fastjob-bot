@@ -1,72 +1,100 @@
 ﻿FastJobs Bot — Complete Guide
 =============================
 
-What this does
-- Automates employer-side “Bump this job”
-- Logs results to SQLite (data/fastjob.db)
-- Optional Streamlit dashboard to view jobs, bumps, and coin usage
+Automates employer-side "Bump this job" on FastJobs, logs to SQLite, and includes a Streamlit dashboard.
 
-Prerequisites
-- Windows + PowerShell
-- Python 3.11+
-- Git (optional)
-- Credentials in .env (do NOT commit)
+What’s in this repo
+- fastjob_bot.py — main automation (prompts for interval each run)
+- login_check.py — saves login session to storage/state.json
+- db.py — SQLite schema/helpers (data/fastjob.db)
+- dashboard/app.py — Streamlit UI (tables + coin chart + CSV export)
+- start_fastjobs.ps1 — one-command launcher (handles setup + run)
+- .env.example — template for credentials (copy to .env)
 
-First-time setup (once per machine)
-1) Open PowerShell in the project folder:
-   cd <path>\fastjob-bot
-2) Create and activate venv:
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-3) Install deps:
-   pip install -r requirements.txt
-   # If Playwright browsers not installed yet:
-   python -m playwright install
-4) Save session (if needed):
-   python .\login_check.py
+Ignored (via .gitignore): .env, data/, storage/, .venv/, __pycache__/, *.log, *.db, *.png
 
-Daily use (start-of-day)
-1) Run the one-command launcher:
-   .\start_fastjobs.ps1
-   - Choose Dry (D) vs Live (L)
-   - Set LIMIT_JOBS (0 = all, 1 = first job)
-   - The bot will ask for the time interval (blank = single run)
-   - After the bot finishes, choose Y to open dashboard (new window)
+Environment setup (.env)
+1) Create your .env from the template:
+   Copy-Item .\.env.example .\.env
+   notepad .\.env
+2) Fill with your values:
+   FASTJOBS_EMAIL=you@example.com
+   FASTJOBS_PASSWORD=your_password
+   FASTJOBS_LOGIN_URL=https://employer.fastjobs.sg/site/login/
+   STORAGE_STATE=storage/state.json
+3) Do not commit .env (already ignored)
 
-Manual runs (advanced)
-# DRY run:
-true="true"
-0="0"
-python .\fastjob_bot.py
+First run (one command)
+1) Set-ExecutionPolicy -Scope Process Bypass -Force   (only if needed)
+2) .\start_fastjobs.ps1
 
-# LIVE run (spends coins):
-true="false"
-0="0"
-python .\fastjob_bot.py
+The launcher will:
+1) Ensure virtualenv and requirements
+2) Ensure .env exists (copies from .env.example if needed)
+3) Ensure Playwright browsers are installed
+4) Ensure login session exists (runs login_check.py if missing)
+5) Prompt for DRY/LIVE and LIMIT_JOBS
+6) Run the bot (you will enter the time interval)
+7) Offer to open the dashboard in a new window
 
-Dashboard (if not using the launcher)
+Daily usage (after first run)
+.\start_fastjobs.ps1
+Stopping:
+- Bot window: Ctrl + C
+- Dashboard window: Ctrl + C
+
+Dashboard (manual start if needed)
 streamlit run .\dashboard\app.py
+(default port 8501; use --server.port 8502 to change)
+Shows jobs, recent bumps (filters), coin-usage chart, and CSV export
 
-Stopping
-- Bot: Ctrl+C in its terminal
-- Dashboard: Ctrl+C in its window (or .\stop_dashboard.ps1)
-
-Artifacts & Data
-- Screenshots/HTML: .\data\
-- Database: .\data\fastjob.db
-  - jobs(job_id, title, last_seen_at)
-  - bumps(id, job_id, bumped_at, coins_used, outcome)
+Useful commands
+- Activate venv:
+  .\.venv\Scripts\Activate.ps1
+- DRY run:
+  $env:DRY_RUN="true";  $env:LIMIT_JOBS="0";  python .\fastjob_bot.py
+- LIVE run (spends coins):
+  $env:DRY_RUN="false"; $env:LIMIT_JOBS="0";  python .\fastjob_bot.py
+- Save/refresh login session (creates storage/state.json):
+  python .\login_check.py
+- Inspect artifacts and DB:
+  explorer .\data
+  python - << 'PY'
+import sqlite3
+conn = sqlite3.connect('data/fastjob.db')
+print('Jobs:')
+for r in conn.execute('select job_id,title,last_seen_at from jobs order by last_seen_at desc'): print(r)
+print('\nRecent bumps:')
+for r in conn.execute('select id,job_id,bumped_at,coins_used,outcome from bumps order by id desc limit 10'): print(r)
+PY
 
 Troubleshooting
-- “DB not found”: run the bot once to create data\fastjob.db
-- “Port in use”: start dashboard with another port:
+- Playwright TLS/IPv6 hiccups:
+  $env:NODE_OPTIONS="--dns-result-order=ipv4first"
+  python -m playwright install chromium
+- Database not found:
+  Run the bot once (DRY is fine) to create data/fastjob.db
+- Dashboard port in use:
   streamlit run .\dashboard\app.py --server.port 8502
-- “Module not found”: re-run pip install -r requirements.txt
-- “Session expired”: python .\login_check.py
+- Execution policy blocks scripts:
+  Set-ExecutionPolicy -Scope Process Bypass -Force
 
 Sharing with a teammate
-- Zip the repo **without**: .venv, data, storage
-- They will:
-  - Create venv + install requirements
-  - Run python .\login_check.py to save session
-  - Use .\\start_fastjobs.ps1 to run
+Share the repo or zip excluding: .venv/, data/, storage/, .env
+Teammate quick start:
+  git clone <repo>
+  cd fastjob-bot
+  Copy-Item .\.env.example .\.env   (then edit with their creds)
+  Set-ExecutionPolicy -Scope Process Bypass -Force
+  .\start_fastjobs.ps1
+
+Repo hygiene
+Ignored by .gitignore:
+  .venv/
+  __pycache__/
+  .env
+  storage/
+  data/
+  *.db
+  *.log
+  *.png
