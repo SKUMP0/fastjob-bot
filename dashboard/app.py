@@ -3,11 +3,10 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-# ---- Paths ----
 DB_PATH = Path(__file__).resolve().parents[1] / "data" / "fastjob.db"
 
 st.set_page_config(page_title="FastJobs Bot Dashboard", layout="wide")
-st.title("📈 FastJobs Bot — Bumps & Coins")
+st.title("FastJobs Bot — Bumps & Coins")
 
 # ---- DB checks ----
 if not DB_PATH.exists():
@@ -48,11 +47,30 @@ jobs, bumps = load_tables(conn)
 # ---- Sidebar Filters ----
 with st.sidebar:
     st.header("Filters")
-    job_options = ["All"] + sorted(jobs["job_id"].astype(str).unique().tolist())
-    sel_job = st.selectbox("Job", job_options, index=0)
+
+    # Build options by TITLE (display) but keep job_id as the underlying value
+    if jobs.empty:
+        job_option = "All"
+        job_selection = "All"
+    else:
+        # List by title for readability; include [job_id] to disambiguate duplicates
+        job_records = jobs[["job_id", "title"]].dropna().copy()
+        job_records["job_id"] = job_records["job_id"].astype(str)
+        job_records = job_records.sort_values("title", kind="stable")
+
+        options = ["All"] + job_records.to_dict("records")
+        job_selection = st.selectbox(
+            "Job",
+            options=options,
+            index=0,
+            format_func=lambda o: "All" if o == "All" else f'{o.get("title","(no title)")} [{o.get("job_id","?")}]'
+        )
+
     outcome_options = ["All", "bumped", "dry-run", "modal-not-found", "insufficient-coins", "bump-failed", "bumped-unknown-coins"]
     sel_outcome = st.selectbox("Outcome", outcome_options, index=0)
-    st.caption("Tip: Choose 'bumped' to focus on real coin usage.")
+    st.caption("Tip: Choose 'bumped' to focus on real coin usage; keep 'All' to include dry-runs.")
+
+    # Date range (defaults to last date with data)
     if not bumps.empty:
         min_date = bumps["bumped_at"].min().date()
         max_date = bumps["bumped_at"].max().date()
@@ -62,10 +80,13 @@ with st.sidebar:
 
 # Apply filters
 df = bumps.copy()
-if sel_job != "All":
-    df = df[df["job_id"].astype(str) == sel_job]
+if job_selection != "All":
+    sel_job_id = job_selection["job_id"]
+    df = df[df["job_id"].astype(str) == sel_job_id]
+
 if sel_outcome != "All":
     df = df[df["outcome"] == sel_outcome]
+
 if date_range and isinstance(date_range, tuple) and len(date_range) == 2:
     start = pd.to_datetime(date_range[0])
     end = pd.to_datetime(date_range[1]) + pd.Timedelta(days=1)
@@ -78,6 +99,7 @@ with left:
 with mid:
     st.metric("Total Bumps (filtered)", len(df))
 with right:
+    # Only count real coins for this KPI
     coins_total = int(df.loc[df["outcome"] == "bumped", "coins_used"].fillna(0).sum())
     st.metric("Coins Used (filtered)", coins_total)
 
@@ -95,14 +117,20 @@ if df.empty:
 else:
     st.dataframe(df, use_container_width=True)
 
-# ---- Coins time-series ----
+# ---- Coins time-series (include dry-runs as 0 to show a baseline) ----
 st.subheader("Coin Usage Over Time")
-coins_df = df[df["outcome"] == "bumped"].copy()
-if coins_df.empty:
-    st.info("No real coin usage to chart yet. Try switching outcome to 'bumped' or widening the date range.")
+if df.empty:
+    st.info("No data to chart yet. Try widening the date range.")
 else:
-    coins_df = coins_df.set_index("bumped_at").sort_index()
-    st.line_chart(coins_df["coins_used"])
+    ts = df.copy()
+    ts = ts.sort_values("bumped_at")
+    # Include dry-runs as zero to create a baseline
+    ts["coins_plot"] = ts.apply(
+        lambda r: int(r["coins_used"]) if pd.notnull(r["coins_used"]) and r.get("outcome") == "bumped" else 0,
+        axis=1
+    )
+    ts = ts.set_index("bumped_at")
+    st.line_chart(ts[["coins_plot"]])
 
 # ---- CSV export ----
 st.subheader("Export")
@@ -115,4 +143,4 @@ if not df.empty:
         mime="text/csv",
     )
 
-st.caption("Reads SQLite at data/fastjob.db • No write operations.")
+st.caption("Reads SQLite at data/fastjob.db • Filters by job title • Chart shows dry-runs as 0 for a baseline.")
