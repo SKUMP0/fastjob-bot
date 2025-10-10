@@ -84,32 +84,86 @@ def ensure_logged_in(page: Page) -> None:
     except TimeoutError:
         pass  # probably already logged-in
 
-def goto_jobs_list(page: Page) -> None:
-    page.goto(DASH_URL, wait_until="domcontentloaded")
-    page.wait_for_load_state("networkidle")
-    try: page.locator(".header-credits-available").wait_for(state="visible", timeout=2500)
-    except Exception: pass
-    ensure_clean_ui(page)
-
-    # Prefer UI nav if present
-    for name in ["Manage English Jobs","English Jobs","Manage Jobs","Jobs","Job Listings"]:
+def goto_jobs_list(page):
+    """
+    Navigate to a Jobs listing page that contains job cards.
+    Retries across menu labels and direct URLs, clears modals/popups,
+    and refreshes once before giving up.
+    """
+    def has_cards() -> bool:
         try:
-            page.get_by_role("link", name=re.compile(rf"^{name}$", re.I)).first.click(timeout=1000)
-            page.wait_for_load_state("networkidle")
-            if page.locator("div.job-ad-flexbox").count() > 0: return
-        except Exception: pass
+            return page.locator("div.job-ad-flexbox").count() > 0
+        except Exception:
+            return False
 
-    # Direct URLs with one auto-retry
-    for attempt in range(2):
+    def try_menu_clicks() -> bool:
+        # common menu labels we’ve seen
+        names = ["Manage Jobs", "My Jobs", "English Jobs", "Jobs", "Job Listings", "Manage Job"]
+        for name in names:
+            try:
+                # close overlays before trying a click
+                try:
+                    wait_for_no_modal(page)
+                    close_spurious_popups(page)
+                except Exception:
+                    pass
+                lnk = page.get_by_role("link", name=re.compile(rf"^{name}$", re.I)).first
+                if lnk.count() > 0:
+                    lnk.click(timeout=1500)
+                    page.wait_for_load_state("networkidle")
+                    try:
+                        wait_for_no_modal(page)
+                    except Exception:
+                        pass
+                    if has_cards():
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def try_direct_urls() -> bool:
         for url in JOBS_URLS:
             try:
+                try:
+                    wait_for_no_modal(page)
+                    close_spurious_popups(page)
+                except Exception:
+                    pass
                 page.goto(url, wait_until="domcontentloaded")
                 page.wait_for_load_state("networkidle")
-                if page.locator("div.job-ad-flexbox").count() > 0: return
-            except Exception: continue
-        if attempt == 0:
-            page.reload(); page.wait_for_load_state("networkidle")
+                try:
+                    wait_for_no_modal(page)
+                except Exception:
+                    pass
+                if has_cards():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    # --- Attempts: menu → urls → refresh + retry ---
+    if try_menu_clicks() or try_direct_urls():
+        return
+
+    # one refresh of the canonical URL then retry
+    try:
+        page.goto(JOBS_URLS[-1], wait_until="domcontentloaded")
+        page.wait_for_load_state("networkidle")
+    except Exception:
+        pass
+
+    if try_menu_clicks() or try_direct_urls():
+        return
+
+    # final diagnostics before failing
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    try:
+        ss(page, f"data/jobs_nav_fail_{ts}.png", full=True)
+        dump_html(page, f"data/jobs_nav_fail_{ts}.html")
+    except Exception:
+        pass
     raise RuntimeError("Could not reach a Jobs list page with job cards.")
+
 
 # ---------- discovery helpers ----------
 
@@ -400,7 +454,19 @@ def main():
             while True:
                 start = datetime.now()
                 print(f"\n=== Cycle @ {start.isoformat(timespec='seconds')}Z ===")
-                run_cycle()
+                try:
+                    run_cycle()
+                except Exception as e:
+                    # recover instead of crashing the loop
+                    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                    print(f"[WARN] Cycle failed: {e.__class__.__name__}: {e}")
+                    try:
+                        # if page is still around, capture evidence via helper(s)
+                        pass  # optional: add a lightweight capture here if you keep a page reference
+                    except Exception:
+                        pass
+                    time.sleep(10)  # brief backoff before computing remaining sleep
+
                 elapsed = (datetime.now() - start).total_seconds()
                 sleep_left = max(0, interval - int(elapsed))
                 if sleep_left > 0:
@@ -410,6 +476,7 @@ def main():
             print("\n[LOOP] Stopped by user.")
     else:
         run_cycle()
+
 
 if __name__ == "__main__":
     main()
